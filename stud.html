@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Student - Live Learning Sync</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.1); border-radius: 10px; }
+    </style>
+</head>
+<body class="bg-slate-50 overflow-hidden">
+    <div id="app-root" class="h-screen flex flex-col overflow-hidden"></div>
+
+    <!-- 오버레이 -->
+    <div id="overlay" class="fixed inset-0 bg-white flex flex-col items-center justify-center z-50">
+        <div id="loader" class="w-12 h-12 border-4 border-blue-100 border-t-blue-600 rounded-full animate-spin mb-4"></div>
+        <p id="overlay-text" class="text-slate-400 font-bold text-sm tracking-widest animate-pulse uppercase text-center px-6">Connecting to Lab...</p>
+    </div>
+
+    <!-- 정보 수정 모달 -->
+    <div id="edit-profile-modal" class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[60] flex items-center justify-center p-6">
+        <div class="bg-white w-full max-w-sm rounded-[2.5rem] p-10 shadow-2xl">
+            <h3 class="text-xl font-black mb-6">정보 수정</h3>
+            <div class="space-y-4">
+                <input id="edit-name" placeholder="성함" class="w-full p-4 bg-slate-50 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 border border-transparent transition-all">
+                <input id="edit-org" placeholder="소속" class="w-full p-4 bg-slate-50 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 border border-transparent transition-all">
+                <div class="flex gap-2">
+                    <button onclick="updateProfile()" class="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-bold">변경 저장</button>
+                    <button onclick="toggleEditProfile(false)" class="px-6 py-4 bg-slate-100 text-slate-500 rounded-2xl font-bold">취소</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Firebase 설정 모달 -->
+    <div id="config-modal" class="hidden fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[60] flex items-center justify-center p-6">
+        <div class="bg-white w-full max-w-lg rounded-[2.5rem] p-10 shadow-2xl overflow-y-auto max-h-[90vh] custom-scrollbar">
+            <div class="flex justify-between items-center mb-6">
+                <h3 class="text-xl font-black text-slate-900">시스템 연동 설정</h3>
+                <button onclick="toggleConfigModal(false)" class="text-slate-300 hover:text-slate-600 transition-all"><i data-lucide="x"></i></button>
+            </div>
+            <div class="space-y-6">
+                <textarea id="config-input" class="w-full h-64 p-5 bg-slate-50 rounded-2xl font-mono text-xs outline-none border border-transparent focus:border-blue-500" placeholder='SDK Config JSON...'></textarea>
+                <div class="flex gap-3">
+                    <button onclick="saveNewConfig()" class="flex-1 py-4 bg-blue-600 text-white rounded-2xl font-bold shadow-lg shadow-blue-100 hover:bg-blue-700 transition-all">저장 및 새로고침</button>
+                    <button onclick="resetConfig()" class="px-6 py-4 bg-slate-100 text-slate-600 rounded-2xl font-bold hover:bg-slate-200 transition-all">초기화</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-app.js";
+        import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-auth.js";
+        import { getFirestore, doc, setDoc, updateDoc, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore.js";
+
+        const DEFAULT_FIREBASE_CONFIG = { apiKey: "AIzaSyDiGnJhZBQEiyHukSoytfaFnssmx59qPyk", authDomain: "instruct-test.firebaseapp.com", projectId: "instruct-test", storageBucket: "instruct-test.firebasestorage.app", messagingSenderId: "415295867482", appId: "1:415295867482:web:6a0d5764109aee7f6d2663" };
+        const appId = 'instruct-test-session';
+
+        let firebaseConfig = JSON.parse(localStorage.getItem('student_fb_config')) || DEFAULT_FIREBASE_CONFIG;
+        let app, auth, db, user = null;
+        let labSteps = [], currentStep = 0, lastKnownStep = null, myStatus = false, isHelpRequested = false;
+        let chatMessage = "", showChat = false, lastChatTime = null;
+
+        function initFirebase() {
+            try {
+                app = initializeApp(firebaseConfig);
+                auth = getAuth(app);
+                db = getFirestore(app);
+                onAuthStateChanged(auth, (u) => { if (u) { user = u; startSync(); renderOnboarding(); } });
+                signInAnonymously(auth).catch(err => {
+                    const ot = document.getElementById('overlay-text'); if (ot) ot.innerHTML = `인증 오류: ${err.code}`;
+                });
+            } catch (err) { renderOnboarding(); }
+        }
+
+        window.toggleConfigModal = (show) => {
+            if (show) { document.getElementById('config-input').value = JSON.stringify(firebaseConfig, null, 2); document.getElementById('config-modal').classList.remove('hidden'); }
+            else document.getElementById('config-modal').classList.add('hidden');
+        };
+
+        window.toggleEditProfile = (show) => {
+            const modal = document.getElementById('edit-profile-modal');
+            if (show) modal.classList.remove('hidden');
+            else modal.classList.add('hidden');
+        };
+
+        window.updateProfile = async () => {
+            const name = document.getElementById('edit-name').value.trim();
+            const org = document.getElementById('edit-org').value.trim();
+            if (!name || !org) return alert("빈칸을 채워주세요.");
+            try {
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'students', user.uid), { name, affiliation: org });
+                toggleEditProfile(false);
+            } catch (err) { alert("업데이트 실패"); }
+        };
+
+        window.saveNewConfig = () => { try { localStorage.setItem('student_fb_config', JSON.stringify(JSON.parse(document.getElementById('config-input').value))); location.reload(); } catch (err) { alert("JSON 형식 에러"); } };
+        window.resetConfig = () => { if (confirm("기본 설정으로 초기화할까요?")) { localStorage.removeItem('student_fb_config'); location.reload(); } };
+
+        // [수정] 공지사항 닫기 전역 함수
+        window.closeChatNotice = () => {
+            showChat = false;
+            renderMain();
+        };
+
+        initFirebase();
+
+        function renderOnboarding() {
+            const overlay = document.getElementById('overlay');
+            overlay.innerHTML = `
+                <div class="bg-white p-10 rounded-[2.5rem] shadow-2xl max-w-sm w-full border border-slate-100 text-center relative z-50">
+                    <button onclick="toggleConfigModal(true)" class="absolute top-6 right-6 p-2 text-slate-300 hover:text-blue-500 transition-all"><i data-lucide="settings" size="20"></i></button>
+                    <h2 class="text-xl font-bold mb-8 flex items-center justify-center gap-3"><i data-lucide="user-plus" class="text-blue-600"></i> 학생 등록</h2>
+                    <div class="space-y-5 text-left">
+                        <input id="input-name" required placeholder="성함" class="w-full p-4 bg-slate-50 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 border border-transparent focus:bg-white transition-all font-medium">
+                        <input id="input-org" required placeholder="소속 (팀/기관)" class="w-full p-4 bg-slate-50 rounded-xl outline-none focus:ring-2 focus:ring-blue-500 border border-transparent focus:bg-white transition-all font-medium">
+                        <button id="btn-join" class="w-full py-5 bg-blue-600 text-white rounded-2xl font-bold shadow-xl shadow-blue-100 active:scale-95 transition-all flex items-center justify-center gap-2"><span>입장하기</span></button>
+                    </div>
+                </div>`;
+            lucide.createIcons();
+            document.getElementById('btn-join').onclick = async () => {
+                const n = document.getElementById('input-name').value.trim();
+                const o = document.getElementById('input-org').value.trim();
+                if (!n || !o) return alert("정보를 입력하세요.");
+                try {
+                    await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'students', user.uid), { 
+                        name: n, affiliation: o, isCompleted: false, isHelpRequested: false, lastActive: serverTimestamp() 
+                    });
+                    document.getElementById('overlay').classList.add('hidden');
+                } catch (err) { document.getElementById('overlay').classList.add('hidden'); }
+            };
+        }
+
+        function startSync() {
+            if (!db) return;
+            onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'sessions', 'main-session'), (snap) => {
+                if (snap.exists()) {
+                    const data = snap.data();
+                    labSteps = data.steps || []; const newStep = data.currentStep || 0;
+                    if (lastKnownStep !== null && newStep !== lastKnownStep) {
+                        updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'students', user.uid), { isCompleted: false, isHelpRequested: false }).catch(()=>{});
+                    }
+                    lastKnownStep = newStep; currentStep = newStep;
+                    
+                    // 새 메시지가 왔을 때만 팝업 표시
+                    if (data.chatMessage && (!lastChatTime || data.chatUpdatedAt?.toMillis() > lastChatTime)) {
+                        chatMessage = data.chatMessage; 
+                        lastChatTime = data.chatUpdatedAt?.toMillis(); 
+                        showChat = true;
+                    }
+                    
+                    const overlay = document.getElementById('overlay');
+                    const ot = document.getElementById('overlay-text');
+                    if (overlay && !overlay.classList.contains('hidden')) { 
+                        if (ot) ot.innerText = "연결됨. 정보를 입력하세요."; 
+                        if (document.getElementById('loader')) document.getElementById('loader').classList.add('hidden'); 
+                    }
+                    renderMain();
+                }
+            }, (err) => { if (document.getElementById('overlay-text')) document.getElementById('overlay-text').innerHTML = `동기화 실패: 보안 규칙을 확인하세요.`; });
+
+            onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'students', user.uid), (snap) => { 
+                if (snap.exists()) { 
+                    const d = snap.data();
+                    myStatus = d.isCompleted || false; 
+                    isHelpRequested = d.isHelpRequested || false;
+                    const editName = document.getElementById('edit-name');
+                    const editOrg = document.getElementById('edit-org');
+                    if(editName) editName.value = d.name || "";
+                    if(editOrg) editOrg.value = d.affiliation || "";
+                    renderFooter(); 
+                } 
+            });
+
+            setInterval(async () => { if (user && db) await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'students', user.uid), { lastActive: serverTimestamp() }).catch(() => {}); }, 5000);
+        }
+
+        window.requestHelp = async () => {
+            if (!db) return;
+            try {
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'students', user.uid), { 
+                    isHelpRequested: !isHelpRequested 
+                });
+            } catch (err) { alert("도움 요청 실패"); }
+        };
+
+        window.copyChat = () => { 
+            const t = document.createElement('textarea'); 
+            t.value = chatMessage; 
+            document.body.appendChild(t); 
+            t.select(); 
+            document.execCommand('copy'); 
+            document.body.removeChild(t); 
+            alert("공지 내용이 복사되었습니다."); 
+        };
+
+        function renderMain() {
+            const data = labSteps[currentStep]; if (!data) return;
+            const getValidUrl = (url) => url ? (url.trim().startsWith('http') ? url.trim() : `https://${url.trim()}`) : '';
+            document.getElementById('app-root').innerHTML = `
+                <main class="flex-1 flex flex-col min-w-0 h-full bg-white overflow-hidden relative">
+                    <header class="h-16 border-b flex items-center justify-between px-6 bg-slate-50/50 shrink-0">
+                        <div class="flex items-center gap-4">
+                            <span class="px-3 py-1 bg-green-100 text-green-700 text-[10px] font-black rounded-full uppercase tracking-widest">Student Mode</span>
+                            <div class="flex items-center gap-2 px-3 py-1 rounded-full bg-green-50 text-green-600 border border-green-100 text-[10px] font-bold"><i data-lucide="wifi" size="12"></i> LIVE SYNC ACTIVE</div>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <button onclick="toggleEditProfile(true)" class="flex items-center gap-2 px-3 py-1.5 bg-slate-200 hover:bg-slate-300 rounded-lg text-[10px] font-bold transition-all"><i data-lucide="user-edit" size="12"></i> 이름 변경</button>
+                            <button onclick="toggleConfigModal(true)" class="p-2 text-slate-300 hover:text-blue-500 transition-all"><i data-lucide="settings" size="16"></i></button>
+                        </div>
+                    </header>
+                    
+                    <!-- 인스트럭터 공지사항 팝업 (10pt 폰트 적용) -->
+                    ${showChat ? `
+                    <div class="w-full bg-indigo-600 text-white px-6 py-3 flex items-center justify-between shadow-lg z-30 animate-in slide-in-from-top duration-300">
+                        <div class="flex items-center gap-3 overflow-hidden text-[10pt] font-bold">
+                            <i data-lucide="bell" size="14" class="shrink-0"></i> 
+                            <span class="truncate">${chatMessage}</span>
+                        </div>
+                        <div class="flex items-center gap-2 shrink-0 ml-4">
+                            <button onclick="copyChat()" class="px-3 py-1.5 bg-white/10 hover:bg-white/20 rounded-lg text-[9pt] font-black transition-all flex items-center gap-1.5">
+                                <i data-lucide="copy" size="12"></i> 복사
+                            </button>
+                            <button onclick="closeChatNotice()" class="p-1.5 hover:bg-white/10 rounded-lg transition-all">
+                                <i data-lucide="x" size="16"></i>
+                            </button>
+                        </div>
+                    </div>` : ''}
+
+                    <div class="flex-1 overflow-y-auto p-4 md:p-8 custom-scrollbar min-h-0 flex flex-col items-center">
+                        <div class="max-w-5xl w-full flex-1 flex flex-col items-center justify-center py-10">
+                            ${data.imageUrl ? `<img src="${data.imageUrl}" class="max-w-full max-h-[65vh] rounded-3xl shadow-2xl object-contain border-4 md:border-8 border-white bg-white mb-8">` : `<div class="text-slate-200 italic mb-8">이미지가 설정되지 않았습니다</div>`}
+                            ${data.linkUrl ? `<div class="w-full flex justify-center"><a href="${getValidUrl(data.linkUrl)}" target="_blank" class="flex items-center gap-3 px-10 py-5 bg-blue-600 text-white rounded-2xl font-bold shadow-xl active:scale-95 transition-all"><i data-lucide="external-link" size="20"></i>참고 사이트 접속</a></div>` : ''}
+                        </div>
+                    </div>
+                    <footer id="footer-actions" class="h-24 border-t flex items-center justify-end px-10 bg-white/90 backdrop-blur-md shrink-0 gap-3"></footer>
+                </main>`;
+            renderFooter(); lucide.createIcons();
+        }
+
+        function renderFooter() {
+            const footer = document.getElementById('footer-actions'); if (!footer) return;
+            footer.innerHTML = `
+                <button onclick="requestHelp()" class="flex items-center gap-2 px-8 py-4 rounded-2xl font-bold transition-all shadow-xl active:scale-95 ${isHelpRequested ? 'bg-orange-500 text-white shadow-orange-100 animate-pulse' : 'bg-white border border-orange-200 text-orange-500 hover:bg-orange-50'}">
+                    <i data-lucide="help-circle" size="20"></i> ${isHelpRequested ? '도움 요청 중' : '도움 요청'}
+                </button>
+                <button id="toggle-done" class="flex items-center gap-3 px-10 py-4 rounded-2xl font-bold transition-all shadow-2xl active:scale-95 ${myStatus ? 'bg-green-500 text-white shadow-green-100' : 'bg-slate-900 text-white shadow-slate-200'}">
+                    <i data-lucide="check-circle-2" size="20"></i> ${myStatus ? '실습 완료됨' : '현재 단계 완료'}
+                </button>`;
+            document.getElementById('toggle-done').onclick = async () => { 
+                await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'students', user.uid), { isCompleted: !myStatus, isHelpRequested: false }); 
+            };
+            lucide.createIcons();
+        }
+    </script>
+</body>
+</html>
